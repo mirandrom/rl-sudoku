@@ -1,15 +1,38 @@
+import argparse
 import gym
 from gym import spaces
 import numpy as np
 import random
 from collections import deque
+import os
 
-from typing import Dict
+import ray
+from ray import tune
+from ray.tune import grid_search
+from ray.rllib.env import EnvContext
+from ray.rllib.policy import Policy
+from ray.rllib.models import ModelCatalog
+from ray.rllib.models.torch.torch_modelv2 import TorchModelV2
+from ray.rllib.models.torch.fcnet import FullyConnectedNetwork as TorchFC
+from ray.rllib.utils.test_utils import check_learning_achieved
+from ray.rllib.utils.framework import try_import_torch
+torch, nn = try_import_torch()
+
+from typing import Dict, List, Optional
+from ray.rllib.utils.typing import TensorType, Tuple, Union
+
+parser = argparse.ArgumentParser()
+parser.add_argument("--run", type=str, default="PPO")
+parser.add_argument("--as-test", action="store_true")
+parser.add_argument("--stop-iters", type=int, default=50)
+parser.add_argument("--stop-timesteps", type=int, default=100000)
+parser.add_argument("--stop-reward", type=float, default=0.1)
 
 
 class ConstraintSudoku(gym.Env):
     # Adapted from http://norvig.com/sudoku.html
-    def __init__(self, d: int = 3, max_num_steps: int = 1e6):
+    def __init__(self, config: EnvContext):
+        d = config.get('d', 3)
         assert d % 2 == 1, "d must be odd"
         self.d = d
         self.D = d**2
@@ -27,7 +50,7 @@ class ConstraintSudoku(gym.Env):
             'col': spaces.Discrete(self.D),
             'val': spaces.Discrete(self.D),
         })
-        self.max_num_steps = max_num_steps
+        self.max_num_steps = config.get('max_num_steps', 1e6)
         self.rewards = {
             'impossible_assign': -1,
             'solved_assign': -1,
@@ -72,9 +95,7 @@ class ConstraintSudoku(gym.Env):
         # handle invalid actions
         valid_actions = self.grid[row][col].nonzero()[0]
         if len(valid_actions) == 0:
-            self.grid = self.grid_stack.pop()
-            i,j,k = self.assign_stack.pop()
-            self.grid[i][j][k] = 0
+            self._backtrack()
             meta = {'reward': 'backtrack', 'stack_len': len(self.grid_stack)}
             return self.grid, self.rewards['backtrack'], False, meta
         if val not in valid_actions:
@@ -127,6 +148,17 @@ class ConstraintSudoku(gym.Env):
     def seed(self, seed=1337):
         random.seed(seed)
         return [seed]
+
+    def _backtrack(self):
+        """No valid assigns remain, therefore the previous assign was invalid.
+
+        Because the previous assign may have rendered other cell/values invalid,
+        we pop and revert to the previous grid state to make these cell/values
+        valid again. The previous assign is then set to invalid.
+        """
+        self.grid = self.grid_stack.pop()
+        i, j, k = self.assign_stack.pop()
+        self.grid[i][j][k] = 0
 
     def _random_puzzle(self):
         grid = np.ones((self.D, self.D, self.D), dtype=int)
@@ -199,44 +231,99 @@ class ConstraintSudoku(gym.Env):
         assert 0 <= val <= self.D-1, f"cell value must be in range [0,{self.D-1}]"
 
 
+class HeuristicPolicy(Policy):
+    def __init__(self, observation_space, action_space, config):
+        Policy.__init__(self, observation_space, action_space, config)
+        # example parameter
+        self.w = 1.0
+
+    def compute_actions(
+            self,
+            obs_batch: Union[List[TensorType], TensorType],
+            state_batches: Optional[List[TensorType]] = None,
+            prev_action_batch: Union[List[TensorType], TensorType] = None,
+            prev_reward_batch: Union[List[TensorType], TensorType] = None,
+            info_batch: Optional[Dict[str, list]] = None,
+            episodes: Optional[List["MultiAgentEpisode"]] = None,
+            explore: Optional[bool] = None,
+            timestep: Optional[int] = None,
+            **kwargs) -> \
+            Tuple[TensorType, List[TensorType], Dict[str, TensorType]]:
+        # return action batch, RNN states, extra values to include in batch
+        actions = []
+        for grid in obs_batch:
+            num_valid = [(i, j, n) for i, r in enumerate(grid.sum(axis=-1))
+                         for j, n in enumerate(r) if n > 1]
+            row, col, _ = min(num_valid, key=lambda x: x[-1])
+            val = grid[row][col].nonzero()[0][0]
+            actions += [{'row': row, 'col': col, 'val': val}]
+        return actions, [], {}
+
+    def learn_on_batch(self, samples):
+        # implement your learning code here
+        return {}  # return stats
+
+    def get_weights(self):
+        return {"w": self.w}
+
+    def set_weights(self, weights):
+        self.w = weights["w"]
+
+
+class TorchCustomModel(TorchModelV2, nn.Module):
+    """Example of a PyTorch custom model that just delegates to a fc-net."""
+
+    def __init__(self, obs_space, action_space, num_outputs, model_config,
+                 name):
+        TorchModelV2.__init__(self, obs_space, action_space, num_outputs,
+                              model_config, name)
+        nn.Module.__init__(self)
+
+        self.torch_sub_model = TorchFC(obs_space, action_space, num_outputs,
+                                       model_config, name)
+
+    def forward(self, input_dict, state, seq_lens):
+        input_dict["obs"] = input_dict["obs"].float()
+        fc_out, _ = self.torch_sub_model(input_dict, state, seq_lens)
+        return fc_out, []
+
+    def value_function(self):
+        return torch.reshape(self.torch_sub_model.value_function(), [-1])
+
+
 if __name__ == '__main__':
-    # TODO: clean this up with baseline agent, pytest, and proper logging
-    def get_action(grid: np.ndarray):
-        num_valid = [(i, j, n) for i, r in enumerate(grid.sum(axis=-1)) for j, n in enumerate(r) if n > 1]
-        row, col, _ = min(num_valid, key=lambda x: x[-1])
-        val = grid[row][col].nonzero()[0][0]
-        return {'row': row, 'col': col, 'val': val}
 
-    def check_grid(grid: np.ndarray):
-        assert (grid.sum(axis=-1) == 1).all(), "Each cell must have one remaining valid value"
-        for row in range(len(grid)):
-            row_vals = set(grid[row].nonzero()[-1])
-            assert len(row_vals) == len(grid), f"{row}th row has valid values {row_vals}"
-        for col in range(len(grid)):
-            col_vals = set(grid[:, col, :].nonzero()[-1])
-            assert len(col_vals) == len(grid), f"{col}th col has valid values {col_vals}"
-        d = int(len(grid) ** 0.5)
-        for i in range(d):
-            for j in range(d):
-                i1 = i * d
-                i2 = i1 + d
-                j1 = j * d
-                j2 = j1 + d
-                sq_vals = set(grid[i1:i2, j1:j2].nonzero()[-1])
-                assert len(sq_vals) == len(grid), f"{i},{j}th square has valid values {sq_vals}"
+    args = parser.parse_args()
+    ray.init()
 
-    csdku = ConstraintSudoku()
-    num_trials = 10
-    for i in range(num_trials):
-        grid = csdku.reset()
-        total_reward = 0
-        while True:
-            action = get_action(grid)
-            grid, reward, finished, meta = csdku.step(action)
-            print(reward)
-            total_reward += reward
-            if finished:
-                check_grid(csdku.grid)
-                print(f"Trial {i} reward: {total_reward}")
-                print(csdku.render())
-                break
+    # Can also register the env creator function explicitly with:
+    # register_env("corridor", lambda config: SimpleCorridor(config))
+
+    ModelCatalog.register_custom_model(
+        "my_model", TorchCustomModel)
+
+    config = {
+        "env": ConstraintSudoku,  # or "corridor" if registered above
+        "env_config": {},
+        # Use GPUs iff `RLLIB_NUM_GPUS` env var set to > 0.
+        "num_gpus": int(os.environ.get("RLLIB_NUM_GPUS", "0")),
+        "model": {
+            "custom_model": "my_model",
+        },
+        "lr": grid_search([1e-2, 1e-4, 1e-6]),  # try different lrs
+        "num_workers": 1,  # parallelism
+        "framework": "torch"
+    }
+
+    stop = {
+        "training_iteration": args.stop_iters,
+        "timesteps_total": args.stop_timesteps,
+        "episode_reward_mean": args.stop_reward,
+    }
+
+    results = tune.run(args.run, config=config, stop=stop)
+
+    if args.as_test:
+        check_learning_achieved(results, args.stop_reward)
+    ray.shutdown()
+
